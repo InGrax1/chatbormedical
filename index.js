@@ -3,6 +3,7 @@
 
 const express = require("express");
 const { responderConIA } = require("./gemini");
+const { guardarConsulta } = require("./sheets");
 
 const app = express();
 app.use(express.json());
@@ -171,19 +172,29 @@ app.post("/webhook", async (req, res) => {
     // ── 11. CONFIRMAR CITA ──
     if (action === "medic.confirmar") {
       const datos = getDatosConsulta(req);
-      const nombre = datos.nombre || "Paciente";
 
-      // ── AQUÍ VA TU INTEGRACIÓN CON GOOGLE CALENDAR ──
-      // Por ahora simulamos la confirmación
+      // Extraer todos los campos acumulados en el contexto
+      const consultaCompleta = {
+        nombre:       datos.nombre || queryText,
+        edad:         datos.edad || "",
+        sintoma:      datos.sintoma_texto || "",
+        seguimiento:  datos.respuesta || "",
+        duracion:     datos.duracion_texto || datos.duracion_sistema || "",
+        intensidad:   datos.intensidad_num || datos.intensidad || "",
+        adicionales:  datos.adicionales || "",
+        medicamentos: datos.medicamentos || "",
+        cita:         datos.cita_seleccionada || "Por confirmar",
+      };
 
-      console.log(
-        `[Webhook] Cita confirmada para: ${nombre}`
+      // Guardar en Google Sheets (no bloquea la respuesta si falla)
+      guardarConsulta(consultaCompleta).catch((e) =>
+        console.error("[Sheets] Fallo silencioso:", e.message)
       );
 
+      const nombre = consultaCompleta.nombre || "paciente";
       const respuesta =
         `✅ *¡Cita confirmada, ${nombre}!*\n\n` +
-        `📬 Recibirás un recordatorio antes de tu cita.\n` +
-        `El Dr. González ya tiene tu expediente listo con toda la información que proporcionaste.\n\n` +
+        `📬 El Dr. González ya tiene tu expediente listo.\n` +
         `¿Hay algo más en lo que pueda ayudarte?`;
 
       return res.json({ fulfillmentText: respuesta });
