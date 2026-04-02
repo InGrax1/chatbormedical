@@ -13,13 +13,41 @@ app.use(express.json());
 // ─────────────────────────────────────────────
 
 /**
- * Extrae los parámetros acumulados del contexto "consulta-activa".
- * Dialogflow guarda el estado del paciente en los output contexts.
+ * Extrae los parámetros acumulados fusionando TODOS los contextos activos.
+ * Dialogflow distribuye los parámetros entre contextos según el intent que los capturó,
+ * por eso hay que fusionarlos todos para tener el estado completo del paciente.
  */
 function getDatosConsulta(req) {
   const contexts = req.body.queryResult.outputContexts || [];
-  const consultaCtx = contexts.find((c) => c.name.includes("consulta-activa"));
-  return consultaCtx?.parameters || {};
+  // Fusionar parámetros de todos los contextos (consulta-activa tiene la mayoría,
+  // pero awaiting-* pueden tener campos más recientes)
+  const merged = {};
+  for (const ctx of contexts) {
+    if (ctx.parameters) {
+      Object.assign(merged, ctx.parameters);
+    }
+  }
+  return merged;
+}
+
+/**
+ * Construye el objeto limpio de consulta leyendo todos los contextos fusionados.
+ * Elimina los campos ".original" que Dialogflow agrega automáticamente.
+ */
+function extraerConsultaCompleta(req, citaTexto = "") {
+  const datos = getDatosConsulta(req);
+  // queryText del intent actual puede tener el horario si venimos de medic.horario
+  return {
+    nombre:      datos.nombre      || "",
+    edad:        datos.edad        || "",
+    sintoma:     datos.sintoma_texto || "",
+    seguimiento: datos.respuesta   || "",
+    duracion:    datos.duracion_texto || datos.duracion_sistema || "",
+    intensidad:  String(datos.intensidad_num || datos.intensidad || ""),
+    adicionales: datos.adicionales || "",
+    medicamentos:datos.medicamentos || "",
+    cita:        citaTexto         || "Por confirmar",
+  };
 }
 
 /**
@@ -149,55 +177,72 @@ app.post("/webhook", async (req, res) => {
       let horarioTexto = "";
       if (opcion) {
         const opciones = {
-          1: "mañana a las 10:00 AM",
-          2: "pasado mañana a las 4:00 PM",
-          3: "el viernes a las 9:00 AM",
+          1: "Mañana a las 10:00 AM",
+          2: "Pasado mañana a las 4:00 PM",
+          3: "Viernes a las 9:00 AM",
         };
-        horarioTexto = opciones[opcion] || `la opción ${opcion}`;
+        horarioTexto = opciones[opcion] || `Opción ${opcion}`;
       } else if (fecha && hora) {
         horarioTexto = `${fecha} a las ${hora}`;
       } else {
         horarioTexto = queryText;
       }
 
+      // Guardamos el horario en el contexto para recuperarlo al confirmar
       const respuesta =
         `📋 *Confirma tu cita:*\n\n` +
         `🗓️ Horario: *${horarioTexto}*\n` +
         `👨‍⚕️ Doctor: Dr. González\n\n` +
         `¿Confirmas esta cita? (Sí / No)`;
 
-      return res.json({ fulfillmentText: respuesta });
+      return res.json({
+        fulfillmentText: respuesta,
+        outputContexts: [
+          {
+            name: `${req.body.session}/contexts/cita-pendiente`,
+            lifespanCount: 2,
+            parameters: { cita_texto: horarioTexto },
+          },
+        ],
+      });
     }
 
     // ── 11. CONFIRMAR CITA ──
     if (action === "medic.confirmar") {
-      const datos = getDatosConsulta(req);
+      // Recuperar la cita seleccionada del contexto cita-pendiente
+      const contexts = req.body.queryResult.outputContexts || [];
+      const citaCtx = contexts.find((c) => c.name.includes("cita-pendiente"));
+      const citaTexto = citaCtx?.parameters?.cita_texto || "Por confirmar";
 
-      // Extraer todos los campos acumulados en el contexto
-      const consultaCompleta = {
-        nombre:       datos.nombre || queryText,
-        edad:         datos.edad || "",
-        sintoma:      datos.sintoma_texto || "",
-        seguimiento:  datos.respuesta || "",
-        duracion:     datos.duracion_texto || datos.duracion_sistema || "",
-        intensidad:   datos.intensidad_num || datos.intensidad || "",
-        adicionales:  datos.adicionales || "",
-        medicamentos: datos.medicamentos || "",
-        cita:         datos.cita_seleccionada || "Por confirmar",
-      };
+      // Extraer consulta completa fusionando todos los contextos
+      const consulta = extraerConsultaCompleta(req, citaTexto);
 
-      // Guardar en Google Sheets (no bloquea la respuesta si falla)
-      guardarConsulta(consultaCompleta).catch((e) =>
+      console.log(`[Webhook] Cita confirmada para: ${consulta.nombre}`);
+      console.log(`[Webhook] Consulta completa:`, consulta);
+
+      // Guardar en Google Sheets (no bloquea aunque falle)
+      guardarConsulta(consulta).catch((e) =>
         console.error("[Sheets] Fallo silencioso:", e.message)
       );
 
-      const nombre = consultaCompleta.nombre || "paciente";
+      const nombre = consulta.nombre || "paciente";
       const respuesta =
         `✅ *¡Cita confirmada, ${nombre}!*\n\n` +
-        `📬 El Dr. González ya tiene tu expediente listo.\n` +
-        `¿Hay algo más en lo que pueda ayudarte?`;
+        `🗓️ ${citaTexto}\n` +
+        `👨‍⚕️ Doctor: Dr. González\n\n` +
+        `Tu información quedó registrada. ¡Que te mejores pronto!`;
 
-      return res.json({ fulfillmentText: respuesta });
+      // Resetear TODOS los contextos para que la conversación termine limpia
+      // y frases como "seria todo" no caigan en fallback
+      const contextsToKill = contexts.map((c) => ({
+        name: c.name,
+        lifespanCount: 0,
+      }));
+
+      return res.json({
+        fulfillmentText: respuesta,
+        outputContexts: contextsToKill,
+      });
     }
 
     // ── 12. CANCELAR / CAMBIAR HORARIO ──
